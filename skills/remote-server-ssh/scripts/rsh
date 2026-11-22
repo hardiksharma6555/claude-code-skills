@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# rsh: run one command on a remote host through an existing SSH ControlMaster socket, safely.
+# Usage: rsh HOST 'remote command'
+#   RSH_USER     remote user (default: $USER)
+#   RSH_SOCKET   socket path (default: ~/.ssh/cm-HOST)
+#   RSH_TIMEOUT  seconds before giving up (default: 60)
+#   RSH_LOCK_WAIT seconds to wait for another rsh call on the same socket (default: 120)
+# Exit codes: remote command's code on success; 90 no socket; 91 lock busy; 92 ssh failure (stop, do not retry).
+set -u
+host="${1:?usage: rsh HOST 'command'}"; shift
+cmd="${1:?usage: rsh HOST 'command'}"
+user="${RSH_USER:-$USER}"
+sock="${RSH_SOCKET:-$HOME/.ssh/cm-$host}"
+tmo="${RSH_TIMEOUT:-60}"
+lockdir="${sock}.rsh.lock"
+
+stop() {
+  echo "STOP: $1" >&2
+  echo "Do not retry. Ask the human to reopen the master:" >&2
+  echo "  ssh -S $sock -O exit $user@$host" >&2
+  echo "  ssh -M -S $sock -o ControlPersist=48h -fN $user@$host" >&2
+  exit "$2"
+}
+
+[ -S "$sock" ] || stop "no control socket at $sock" 90
+
+# One call at a time per socket (mkdir is atomic; works on macOS without flock).
+waited=0
+until mkdir "$lockdir" 2>/dev/null; do
+  # Clear a lock left by a crashed call (older than the timeout plus a margin).
+  if [ -d "$lockdir" ] && [ -n "$(find "$lockdir" -maxdepth 0 -mmin +$(( (tmo + 120) / 60 + 1 )) 2>/dev/null)" ]; then
+    rmdir "$lockdir" 2>/dev/null; continue
+  fi
+  sleep 2; waited=$((waited + 2))
+  [ "$waited" -ge "${RSH_LOCK_WAIT:-120}" ] && { echo "rsh: another call holds $lockdir" >&2; exit 91; }
+done
+trap 'rmdir "$lockdir" 2>/dev/null' EXIT
+
+errf="$(mktemp -t rsh.XXXXXX)"
+perl -e "alarm $tmo; exec @ARGV" ssh -S "$sock" -o BatchMode=yes -o ControlMaster=no -o ProxyCommand=false \
+  -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+  -o PubkeyAuthentication=no -o GSSAPIAuthentication=no \
+  -o ConnectTimeout=10 "$user@$host" "timeout $(( tmo > 5 ? tmo - 5 : tmo )) bash -c $(printf %q "$cmd")" 2>"$errf"
+rc=$?
+err="$(cat "$errf")"; rm -f "$errf"
+[ -n "$err" ] && printf '%s\n' "$err" >&2
+
+case "$rc" in
+  142) stop "timed out after ${tmo}s (socket may be hung)" 92 ;;
+  255) stop "ssh failed (rc 255)" 92 ;;
+esac
+if printf '%s' "$err" | grep -q -E "Session open refused|Control socket connect|Permission denied|Connection (closed|reset)|mux_client"; then
+  stop "ssh reported: $(printf '%s' "$err" | grep -m1 -E "Session open refused|Control socket connect|Permission denied|Connection (closed|reset)|mux_client")" 92
+fi
+exit "$rc"
