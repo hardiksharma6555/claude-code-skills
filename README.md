@@ -43,7 +43,7 @@ Published separately (not duplicated here):
 ## Install
 
 ```bash
-git clone <REPO_URL> claude-code-skills-showcase
+git clone https://github.com/hardiksharma6555/claude-code-skills claude-code-skills-showcase
 cd claude-code-skills-showcase
 
 # skills: one folder per skill
